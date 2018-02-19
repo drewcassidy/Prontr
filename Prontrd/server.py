@@ -23,7 +23,7 @@ import sys
 import time
 from enum import IntEnum
 
-import gpiozero
+from gpiozero import LED
 
 serverAddress = '/tmp/prontrd.sock'
 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -50,27 +50,15 @@ class LEDState(IntEnum):
     ERRORED = 6
 
 
-class PSUState(IntEnum):
-    OFF = 0
-    ON = 1
-    ERROR = 2
-
-
-class PrinterState(IntEnum):
-    OFF = 0
-    ON = 1
-    ERROR = 2
-
-
-ledState: LEDState = LEDState.IDLE
-ledIdleColor: {
+ledState = LEDState.IDLE
+ledIdleColor = {
     'hue': 0x00,
     'saturation': 0xFF,
     'brightness': 0xFF}
-psuState: PSUState = PSUState.OFF
-PrinterState: PrinterState = PrinterState.OFF
+psuPower = false
+printerPower = false
 
-publicProperties = ['ledState', 'ledIdleColor', 'psuState', 'printerState']
+publicProperties = ['ledState', 'ledIdleColor', 'psuPower', 'printerPower']
 
 
 def initSocket():  # initialize the socket
@@ -90,7 +78,7 @@ def closeSocket():  # close the socket
     print('Unbound from socket ', serverAddress)
 
 
-def pollSocket(callback):  # poll an open socket and pass its message to a handler
+def pollSocket():  # poll an open socket and pass its message to a handler
 
     # poll for a new connection
     readable, writable, errored = select.select([server], [], [], 0)
@@ -152,47 +140,64 @@ def pollSocket(callback):  # poll an open socket and pass its message to a handl
 
 def handleRequest(message, sock: socket):  # handle a request
     try:
-        if message['command'] == 'read':
+        command = message['command']
+
+        # Read Request
+        if command == 'read':
+            print('handling read request for ', readProperty)
             readProperty = message['property']
 
-            print('handling read request for ', readProperty)
+            # validate Request
+            if readProperty not in publicProperties:
+                return errorResponse(command, 'unknown property')
 
-            if readProperty in publicProperties:
-                return {
-                    'type': 'response',
-                    'property': readProperty,
-                    'value': globals[readProperty]
-                }
-            else:
-                print('invalid read request from property \"{}\": unknown property'.format(
-                    readProperty), file='/dev/stderr')
-                return {'type': 'error'}
+            # return the current value of readProperty
+            return valueResponse(readProperty)
 
-        if message['command'] == 'write':
-            writeProperty = message['property']
-
+        # Write Request
+        if command == 'write':
             print('handling write request for ', writeProperty)
+            writeProperty = message['property']
+            writeValue = message['value']
 
-            if writeProperty in publicProperties:
-                newValue = message['value']
-                if newValue:
-                    if type(newValue) == type(globals[writeProperty]):
-                        globals[writeProperty] = newValue
-                    else:
-                        print('invalid write request to property \"{0}\": type error\ntype {1} is not the same as type {2}'
-                              .format(writeProperty, type(newValue), type(globals[writeProperty])), file='/dev/stderr')
-                else:
-                    print('invalid write request to property \"{}\": no value'
-                          .format(writeProperty), file='/dev/stderr')
+            # validate request
+            if writeProperty not in publicProperties:
+                return errorResponse(command, 'unknown property')
+            if not writeValue:
+                return errorResponse(command, 'no value')
+            if type(writeValue) is not type(globals[writeProperty]):
+                return errorResponse(command, 'type error: type {0} is not the same as type {1}'.format(type(writeValue), type(globals[writeProperty])))
+
+            # make sure we arnt trying to turn off the power while printing
+            if (writeProperty == 'psuPower' and writeValue == false and printerPower == true):
+                print('blocking attempt to disable power while printing!')
             else:
-                print('invalid write request to property \"{}\": unknown property'.format(
-                    writeProperty), file='/dev/stderr')
+                globals[writeProperty] = newValue
+
+            # return the current value of writeProperty
+            return valueResponse(writeProperty)
 
     except KeyError:
         print('invalid request from ', sock.getpeername(), file='/dev/stderr')
     finally:
         return
 
+
+def valueResponse(propertyName: str):
+    return {
+        'command': 'response',
+        'property': readProperty,
+        'value': globals[readProperty]
+    }
+
+
+def errorResponse(command: str= '', errorMessage: str= ''):
+    print('invalid {0} request to property \"{1}\"'.format(
+        command), file='/dev/sterr')
+    if errorMessage:
+        print(errorMessage, file='/dev/stderr')
+
+    return {'command': 'error'}
 
 # main loop
 
@@ -203,7 +208,7 @@ def main():
     while True:
 
         time.sleep(.1)
-        pollSocket(handleRequest)
+        pollSocket()
 
 
 if __name__ == "__main__":
