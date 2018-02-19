@@ -7,8 +7,9 @@ import select
 import socket
 import sys
 import time
-import gpiozero
 from enum import IntEnum
+
+import gpiozero
 
 serverAddress = '/tmp/prontrd.sock'
 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -54,6 +55,8 @@ ledIdleColor: {
     'brightness': 0xFF}
 psuState: PSUState = PSUState.OFF
 PrinterState: PrinterState = PrinterState.OFF
+
+publicProperties = ['ledState', 'ledIdleColor', 'psuState', 'printerState']
 
 
 def initSocket():  # initialize the socket
@@ -135,31 +138,45 @@ def pollSocket(callback):  # poll an open socket and pass its message to a handl
 
 def handleRequest(message, sock: socket):  # handle a request
     try:
-        if message['type'] == 'read':
+        if message['command'] == 'read':
             readProperty = message['property']
-            readResponse = {
-                'type': 'response',
-                'property': readProperty
-            }
 
             print('handling read request for ', readProperty)
 
-            if readProperty == 'ledState':
-                readResponse['value'] = ledState
-            elif readProperty == 'psuState':
-                readResponse['value'] = psuState
-            elif readProperty == 'printerState':
-                readResponse['value'] = printerState
-            elif readProperty == 'ledIdleColor':
-                readResponse['value'] = ledIdleColor
+            if readProperty in publicProperties:
+                return {
+                    'type': 'response',
+                    'property': readProperty,
+                    'value': globals[readProperty]
+                }
             else:
-                readResponse['value'] = 'Unknown Property'
-            return readResponse
-        if message['type'] == 'command':
-            return {}
+                print('invalid read request from property \"{}\": unknown property'.format(
+                    readProperty), file='/dev/stderr')
+                return {'type': 'error'}
+
+        if message['command'] == 'write':
+            writeProperty = message['property']
+
+            print('handling write request for ', writeProperty)
+
+            if writeProperty in publicProperties:
+                newValue = message['value']
+                if newValue:
+                    if type(newValue) == type(globals[writeProperty]):
+                        globals[writeProperty] = newValue
+                    else:
+                        print('invalid write request to property \"{0}\": type error\ntype {1} is not the same as type {2}'
+                              .format(writeProperty, type(newValue), type(globals[writeProperty])), file='/dev/stderr')
+                else:
+                    print('invalid write request to property \"{}\": no value'
+                          .format(writeProperty), file='/dev/stderr')
+            else:
+                print('invalid write request to property \"{}\": unknown property'.format(
+                    writeProperty), file='/dev/stderr')
 
     except KeyError:
         print('invalid request from ', sock.getpeername(), file='/dev/stderr')
+    finally:
         return
 
 
