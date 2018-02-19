@@ -1,98 +1,178 @@
 #!/usr/bin/env python3
 
-import socket
-import select
-import queue
-import sys
+import json
 import os
+import queue
+import select
+import socket
+import sys
 import time
+import gpiozero
+from enum import IntEnum
 
-server_address = '/tmp/prontrd.sock'
-
-
+serverAddress = '/tmp/prontrd.sock'
 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 
-connections = [] # currently open connections
-queues = {} # output queues to sockets
+connections = []  # currently open connections
+queues = {}  # output queues to sockets
+
+IdleColor = (0xFF, 0xFF, 0xFF)
+HeatingColorCold = (0x30, 0x00, 0xFF)
+HeatingColorHot = (0xFF, 0x20, 0x00)
+PrintingColor = (0xDF, 0xEF, 0xFF)
+CompleteColor = (0x00, 0x50, 0xFF)
+CanceledColor = (0xFF, 0x00, 0x00)
+ErroredColor = (0xFF, 0x00, 0x00)
 
 
+class LEDState(IntEnum):
+    OFF = 0
+    IDLE = 1
+    HEATING = 2
+    PRINTING = 3
+    COMPLETE = 4
+    CANCELED = 5
+    ERRORED = 6
 
-# initialize the socket
-def initSocket():
+
+class PSUState(IntEnum):
+    OFF = 0
+    ON = 1
+    ERROR = 2
+
+
+class PrinterState(IntEnum):
+    OFF = 0
+    ON = 1
+    ERROR = 2
+
+
+ledState: LEDState = LEDState.IDLE
+ledIdleColor: {
+    'hue': 0x00,
+    'saturation': 0xFF,
+    'brightness': 0xFF}
+psuState: PSUState = PSUState.OFF
+PrinterState: PrinterState = PrinterState.OFF
+
+
+def initSocket():  # initialize the socket
     try:
-        os.unlink(server_address)
+        os.unlink(serverAddress)
     except OSError:
-        if os.path.exists(server_address):
+        if os.path.exists(serverAddress):
             raise
 
-    server.bind(server_address)
+    server.bind(serverAddress)
     server.listen(1)
-    print('Bound to socket ', server_address)
+    print('Bound to socket ', serverAddress)
 
-# close the socket
-def closeSocket():
+
+def closeSocket():  # close the socket
     server.close()
-    print('Unbound from socket ', server_address)
+    print('Unbound from socket ', serverAddress)
 
-# handle a request
+
+def pollSocket(callback):  # poll an open socket and pass its message to a handler
+
+    # poll for a new connection
+    readable, writable, errored = select.select([server], [], [], 0)
+
+    for s in readable:
+        if s is server:  # a new connection from a client
+            # accept connection
+            connection, client = server.accept()
+            print('Connection opened')
+            connection.setblocking(0)
+
+            # Add connection to input socket list
+            connections.append(connection)
+
+            # Give the connection a queue for data we want to send
+            queues[connection] = queue.Queue()
+
+    if(connections):
+        # poll for incoming data, if we have any open connections
+        readable, writable, errored = select.select(
+            connections, connections, connections, 0)
+
+        # handle reading data
+        for s in readable:
+            # read data from connection
+            msg = s.recv(2048)
+            if msg:
+                # message received
+                print('Received message:')
+                print(msg)
+                msgDict = json.loads(msg, encoding='utf-8')
+
+                responseDict = handleRequest(msgDict, s)
+                response = json.dumps(responseDict).encode('utf-8')
+                if response:
+                    print(response)
+                    queues[s].put(response)
+            else:
+                # no message received, end of transmission
+                print('Connection closed')
+                connections.remove(s)
+                s.close()
+
+        # handle writing data
+        for s in writable:
+            # write data, if present in queue
+            if (not queues[s].empty()):
+                msg = queues[s].get_nowait()
+                s.send(msg)
+
+        # handle connection errors
+        for s in errored:
+            # close connection if an error has occured
+            print('socket connection error on ',
+                  s.getpeername(), file=sys.stderr)
+            connections.remove(s)
+            s.close()
+
+
+def handleRequest(message, sock: socket):  # handle a request
+    try:
+        if message['type'] == 'read':
+            readProperty = message['property']
+            readResponse = {
+                'type': 'response',
+                'property': readProperty
+            }
+
+            print('handling read request for ', readProperty)
+
+            if readProperty == 'ledState':
+                readResponse['value'] = ledState
+            elif readProperty == 'psuState':
+                readResponse['value'] = psuState
+            elif readProperty == 'printerState':
+                readResponse['value'] = printerState
+            elif readProperty == 'ledIdleColor':
+                readResponse['value'] = ledIdleColor
+            else:
+                readResponse['value'] = 'Unknown Property'
+            return readResponse
+        if message['type'] == 'command':
+            return {}
+
+    except KeyError:
+        print('invalid request from ', sock.getpeername(), file='/dev/stderr')
+        return
 
 
 # main loop
+
+
 def main():
     initSocket()
 
     while True:
 
         time.sleep(.1)
-        print('waiting...')
-        # poll for a new connection
-        readable, writable, errored = select.select([ server ], [], [], 0)
-
-        for s in readable:
-            if s is server: # a new connection from a client
-                # accept connection
-                connection, client = server.accept()
-                print('Connection from ', client, ' opened')
-                connection.setblocking(0)
-
-                # Add connection to input socket list
-                connections.append(connection)
-
-                # Give the connection a queue for data we want to send
-                queues[connection] = queue.Queue()
-
-
-        if(connections):
-            # poll for incoming data
-            readable, writable, errored = select.select(connections,connections,connections,0)
-
-            # handle reading data
-            for s in readable:
-                # read data from connection
-                msg = s.recv(2048).decode('utf-8')
-                if msg:
-                    # message received
-                    print('Received message:')
-                    print(msg)
-                else:
-                    # no message received, end of transmission
-                    print('Connection from ', client, ' closed')
-                    connections.remove(s)
-                    s.close()
-
-            # handle writing data
-            for s in writable:
-                # write data, if present in queue
-                if (not queues[s].empty):
-                    msg = queues[s].get_nowait()
-                    s.send(msg);
-
-            # handle connection errors
-            for s in errored:
-                # close connection if an error has occured
-                print('socket connection error on ', s.getpeername(), file=sys.stderr)
-                connections.remove(s)
-                s.close()
+        pollSocket(handleRequest)
 
 
 if __name__ == "__main__":
