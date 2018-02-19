@@ -1,0 +1,6 @@
+{
+    "name": "Homebridge-Prontr-PSUControl",
+    "version": "0.0.1",
+    "description": "Homebridge plugin for controlling a 3D printer power supply using prontrd",
+    "license": "Apache-2.0"
+}
