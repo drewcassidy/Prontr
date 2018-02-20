@@ -20,6 +20,7 @@ import select
 import socket
 import sys
 import time
+import threading
 from enum import IntEnum
 from queue import Queue
 
@@ -28,9 +29,7 @@ from gpiozero import LED
 serverAddress = '/tmp/prontrd.sock'
 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 
-connections = {}  # currently open connections
-inQueues = {}  # input queues to sockets
-outQueues = {}  # output queues to sockets
+connectionQueues = {}  # output queues to sockets
 
 IdleColor = (0xFF, 0xFF, 0xFF)
 HeatingColorCold = (0x30, 0x00, 0xFF)
@@ -50,7 +49,7 @@ class LEDState(IntEnum):
     CANCELED = 5
     ERRORED = 6
 
-
+stateLock = threading.Lock()
 stateProperties = {
     'ledIdleColor':  {
         'hue': 0x00,
@@ -60,19 +59,6 @@ stateProperties = {
     'printerPower': False,
     'printerState': LEDState.IDLE
 }
-
-
-class ConnectionQueue:
-    def __init__(s: socket):
-        self.socket = s
-        self.inputQueue = Queue()
-        self.outputQueue = Queue()
-
-    def input_waiting():
-        return not inputQueue.empty()
-
-    def output_waiting():
-        return not outputQueue.empty()
 
 
 def initSocket():  # initialize the socket
@@ -94,11 +80,11 @@ def closeSocket():  # close the socket
 
 def openConnection(s: socket):
     s.setblocking(0)
-    connections[s] = ConnectionQueue(s)
+    connectionQueues[s] = Queue()
 
 
 def closeConnection(s: socket):
-    connections.pop(s, none)
+    connectionQueues.pop(s, none)
     s.close()
 
 
@@ -131,7 +117,9 @@ def pollSocket():  # poll an open socket and pass its message to a handler
             if msg:
                 # message received
                 decoded = json.loads(msg.decode('utf-8'))
-                connections[s].inputQueue.put(decoded)
+                response = handleRequest(decoded, s)
+                connectionQueues[s].add(response)
+
             else:
                 # no message received, end of transmission
                 print('Connection closed')
@@ -165,43 +153,45 @@ def handleRequest(message, sock: socket):  # handle a request
         if command == 'read':
             readProperty = message['property']
 
-            # validate Request
-            if readProperty not in stateProperties:
-                return errorResponse(readProperty, command, 'unknown property')
+            with stateLock:
+                # validate Request
+                if readProperty not in stateProperties:
+                    return errorResponse(readProperty, command, 'unknown property')
 
-            # return the current value of readProperty
-            return valueResponse(readProperty)
+                # return the current value of readProperty
+                return valueResponse(readProperty, stateProperties[readProperty])
 
         # Write Request
         if command == 'write':
             writeProperty = str(message['property'])
             writeValue = message['value']
 
-            # validate request
-            if writeProperty not in stateProperties:
-                return errorResponse(writeProperty, command, 'unknown property')
-            if not writeValue:
-                return errorResponse(writeProperty, command, 'no value')
+            with stateLock:
+                # validate request
+                if writeProperty not in stateProperties:
+                    return errorResponse(writeProperty, command, 'unknown property')
+                if not writeValue:
+                    return errorResponse(writeProperty, command, 'no value')
 
-            # make sure we arnt trying to turn off the power while printing
-            if (writeProperty == 'psuPower' and writeValue == False and printerPower == True):
-                print('blocking attempt to disable power while printing!',
-                      file=sys.stderr)
-            else:
-                stateProperties[writeProperty] = writeValue
+                # make sure we arnt trying to turn off the power while printing
+                if (writeProperty == 'psuPower' and writeValue == False and printerPower == True):
+                    print('blocking attempt to disable power while printing!',
+                          file=sys.stderr)
+                else:
+                    stateProperties[writeProperty] = writeValue
 
-            # return the current value of writeProperty
-            return valueResponse(writeProperty)
+                # return the current value of writeProperty
+                return valueResponse(writeProperty)
 
     except KeyError:
         print('invalid request from ', sock.getpeername(), file=sys.stderr)
 
 
-def valueResponse(propertyName: str):
+def valueResponse(propertyName: str, propertyValue):
     return {
         'command': 'response',
         'property': propertyName,
-        'value': stateProperties[propertyName]
+        'value': propertyValue
     }
 
 
