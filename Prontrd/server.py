@@ -16,20 +16,21 @@
 
 import json
 import os
-import queue
 import select
 import socket
 import sys
 import time
 from enum import IntEnum
+from queue import Queue
 
 from gpiozero import LED
 
 serverAddress = '/tmp/prontrd.sock'
 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 
-connections = []  # currently open connections
-queues = {}  # output queues to sockets
+connections = {}  # currently open connections
+inQueues = {}  # input queues to sockets
+outQueues = {}  # output queues to sockets
 
 IdleColor = (0xFF, 0xFF, 0xFF)
 HeatingColorCold = (0x30, 0x00, 0xFF)
@@ -50,15 +51,28 @@ class LEDState(IntEnum):
     ERRORED = 6
 
 
-ledState = LEDState.IDLE
-ledIdleColor = {
-    'hue': 0x00,
-    'saturation': 0xFF,
-    'brightness': 0xFF}
-psuPower = false
-printerPower = false
+stateProperties = {
+    'ledIdleColor':  {
+        'hue': 0x00,
+        'saturation': 0xFF,
+        'brightness': 0xFF},
+    'psuPower': False,
+    'printerPower': False,
+    'printerState': LEDState.IDLE
+}
 
-publicProperties = ['ledState', 'ledIdleColor', 'psuPower', 'printerPower']
+
+class ConnectionQueue:
+    def __init__(s: socket):
+        self.socket = s
+        self.inputQueue = Queue()
+        self.outputQueue = Queue()
+
+    def input_waiting():
+        return not inputQueue.empty()
+
+    def output_waiting():
+        return not outputQueue.empty()
 
 
 def initSocket():  # initialize the socket
@@ -78,6 +92,16 @@ def closeSocket():  # close the socket
     print('Unbound from socket ', serverAddress)
 
 
+def openConnection(s: socket):
+    s.setblocking(0)
+    connections[s] = ConnectionQueue(s)
+
+
+def closeConnection(s: socket):
+    connections.pop(s, none)
+    s.close()
+
+
 def pollSocket():  # poll an open socket and pass its message to a handler
 
     # poll for a new connection
@@ -87,14 +111,8 @@ def pollSocket():  # poll an open socket and pass its message to a handler
         if s is server:  # a new connection from a client
             # accept connection
             connection, client = server.accept()
+            openConnection(connection)
             print('Connection opened')
-            connection.setblocking(0)
-
-            # Add connection to input socket list
-            connections.append(connection)
-
-            # Give the connection a queue for data we want to send
-            queues[connection] = queue.Queue()
 
     if(connections):
         # poll for incoming data, if we have any open connections
@@ -104,38 +122,39 @@ def pollSocket():  # poll an open socket and pass its message to a handler
         # handle reading data
         for s in readable:
             # read data from connection
-            msg = s.recv(2048)
+            if s not in connections:
+                print('unknown socket!', file=sys.stderr)
+                s.close()
+                break
+
+            message = s.recv(2048)
             if msg:
                 # message received
-                print('Received message:')
-                print(msg)
-                msgDict = json.loads(msg, encoding='utf-8')
-
-                responseDict = handleRequest(msgDict, s)
-                response = json.dumps(responseDict).encode('utf-8')
-                if response:
-                    print(response)
-                    queues[s].put(response)
+                decoded = json.loads(msg.decode('utf-8'))
+                connections[s].inputQueue.put(decoded)
             else:
                 # no message received, end of transmission
                 print('Connection closed')
-                connections.remove(s)
-                s.close()
+                closeConnection(s)
 
         # handle writing data
         for s in writable:
             # write data, if present in queue
-            if (not queues[s].empty()):
-                msg = queues[s].get_nowait()
-                s.send(msg)
+            if s not in connections:
+                print('unknown socket!', file=sys.stderr)
+                s.close()
+                break
+
+            if connections[s].output_waiting()
+                message = connections[s].outputQueue.get_nowait()
+                s.send(json.dumps(message).encode('utf-8'))
 
         # handle connection errors
         for s in errored:
             # close connection if an error has occured
             print('socket connection error on ',
                   s.getpeername(), file=sys.stderr)
-            connections.remove(s)
-            s.close()
+            closeConnection(s)
 
 
 def handleRequest(message, sock: socket):  # handle a request
@@ -144,58 +163,51 @@ def handleRequest(message, sock: socket):  # handle a request
 
         # Read Request
         if command == 'read':
-            print('handling read request for ', readProperty)
             readProperty = message['property']
 
             # validate Request
-            if readProperty not in publicProperties:
-                return errorResponse(command, 'unknown property')
+            if readProperty not in stateProperties:
+                return errorResponse(readProperty, command, 'unknown property')
 
             # return the current value of readProperty
             return valueResponse(readProperty)
 
         # Write Request
         if command == 'write':
-            print('handling write request for ', writeProperty)
-            writeProperty = message['property']
+            writeProperty = str(message['property'])
             writeValue = message['value']
 
             # validate request
-            if writeProperty not in publicProperties:
-                return errorResponse(command, 'unknown property')
+            if writeProperty not in stateProperties:
+                return errorResponse(writeProperty, command, 'unknown property')
             if not writeValue:
-                return errorResponse(command, 'no value')
-            if type(writeValue) is not type(globals[writeProperty]):
-                return errorResponse(command, 'type error: type {0} is not the same as type {1}'.format(type(writeValue), type(globals[writeProperty])))
+                return errorResponse(writeProperty, command, 'no value')
 
             # make sure we arnt trying to turn off the power while printing
-            if (writeProperty == 'psuPower' and writeValue == false and printerPower == true):
-                print('blocking attempt to disable power while printing!')
+            if (writeProperty == 'psuPower' and writeValue == False and printerPower == True):
+                print('blocking attempt to disable power while printing!',
+                      file=sys.stderr)
             else:
-                globals[writeProperty] = newValue
+                stateProperties[writeProperty] = writeValue
 
             # return the current value of writeProperty
             return valueResponse(writeProperty)
 
     except KeyError:
-        print('invalid request from ', sock.getpeername(), file='/dev/stderr')
-    finally:
-        return
+        print('invalid request from ', sock.getpeername(), file=sys.stderr)
 
 
 def valueResponse(propertyName: str):
     return {
         'command': 'response',
-        'property': readProperty,
-        'value': globals[readProperty]
+        'property': propertyName,
+        'value': stateProperties[propertyName]
     }
 
 
-def errorResponse(command: str= '', errorMessage: str= ''):
-    print('invalid {0} request to property \"{1}\"'.format(
-        command), file='/dev/sterr')
-    if errorMessage:
-        print(errorMessage, file='/dev/stderr')
+def errorResponse(propertyName: str, command: str= '', errorMessage: str= 'generic error'):
+    print('invalid {0} request to property \"{1}\": {2}'.format(
+        command, propertyName, errorMessage), file=sys.stderr)
 
     return {'command': 'error'}
 
@@ -203,6 +215,8 @@ def errorResponse(command: str= '', errorMessage: str= ''):
 
 
 def main():
+    ticker = 0
+
     initSocket()
 
     while True:
