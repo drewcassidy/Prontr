@@ -26,12 +26,11 @@ sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 
 sock.connect(sock_address)
 payload = {
-    'command': 'read',
-    'property': 'ledState',
-    'value': 2
+    'command': 'write',
+    'property': 'printerState',
+    'value': 3
 }
 sock.send(json.dumps(payload).encode('utf-8'))
 msg = sock.recv(2048).decode('utf-8')
 print(msg)
-time.sleep(1)
 sock.close()

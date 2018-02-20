@@ -29,7 +29,8 @@ from gpiozero import LED
 serverAddress = '/tmp/prontrd.sock'
 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 
-connectionQueues = {}  # output queues to sockets
+connections = []
+queues = {}  # output queues to sockets
 
 IdleColor = (0xFF, 0xFF, 0xFF)
 HeatingColorCold = (0x30, 0x00, 0xFF)
@@ -80,11 +81,13 @@ def closeSocket():  # close the socket
 
 def openConnection(s: socket):
     s.setblocking(0)
-    connectionQueues[s] = Queue()
+    connections.append(s)
+    queues[s] = Queue()
 
 
 def closeConnection(s: socket):
-    connectionQueues.pop(s, none)
+    connections.remove(s)
+    queues.pop(s, None)
     s.close()
 
 
@@ -105,6 +108,21 @@ def pollSocket():  # poll an open socket and pass its message to a handler
         readable, writable, errored = select.select(
             connections, connections, connections, 0)
 
+        # handle writing data
+        # do this first so that if it gets closed later
+        # we still have the socket in connections[]
+        for s in writable:
+            # write data, if present in queue
+            if s not in connections:
+                print('unknown socket!', file=sys.stderr)
+                s.close()
+                break
+
+            if not queues[s].empty():
+                message = queues[s].get_nowait()
+                s.send(json.dumps(message).encode('utf-8'))
+
+
         # handle reading data
         for s in readable:
             # read data from connection
@@ -114,28 +132,16 @@ def pollSocket():  # poll an open socket and pass its message to a handler
                 break
 
             message = s.recv(2048)
-            if msg:
+            if message:
                 # message received
-                decoded = json.loads(msg.decode('utf-8'))
+                decoded = json.loads(message.decode('utf-8'))
                 response = handleRequest(decoded, s)
-                connectionQueues[s].add(response)
+                queues[s].put(response)
 
             else:
                 # no message received, end of transmission
                 print('Connection closed')
                 closeConnection(s)
-
-        # handle writing data
-        for s in writable:
-            # write data, if present in queue
-            if s not in connections:
-                print('unknown socket!', file=sys.stderr)
-                s.close()
-                break
-
-            if connections[s].output_waiting()
-                message = connections[s].outputQueue.get_nowait()
-                s.send(json.dumps(message).encode('utf-8'))
 
         # handle connection errors
         for s in errored:
@@ -181,7 +187,7 @@ def handleRequest(message, sock: socket):  # handle a request
                     stateProperties[writeProperty] = writeValue
 
                 # return the current value of writeProperty
-                return valueResponse(writeProperty)
+                return valueResponse(writeProperty, stateProperties[writeProperty])
 
     except KeyError:
         print('invalid request from ', sock.getpeername(), file=sys.stderr)
@@ -201,8 +207,24 @@ def errorResponse(propertyName: str, command: str= '', errorMessage: str= 'gener
 
     return {'command': 'error'}
 
-# main loop
-
+def pollLoop():
+    # wait for a connection...
+    while True:
+        connection, client = sock.accept()
+        try:
+            while True:
+                data = connection.recv(2048)
+                if data:
+                    # data received
+                    message = json.loads(data.decode('utf-8'))
+                    response = handleRequest(message)
+                    if response:
+                        connection.send(json.dumps(response).encode('utf-8'))
+                else:
+                    # connection closed
+                    break
+        finally:
+            connection.close()
 
 def main():
     ticker = 0
